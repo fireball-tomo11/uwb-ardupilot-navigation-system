@@ -25,7 +25,7 @@ ANCHORS: Dict[str, Tuple[float, float, float]] = {
     "0x0004": (3.0, 3.0, 2.0),
 }
 
-PAD_MM = 1000.0   # 表示範囲の余白(mm)
+PAD_MM = 500.0   # 表示範囲の余白(mm)
 HIST_MAX = 800   # 軌跡の保持数
 
 
@@ -244,13 +244,38 @@ HTML = r"""
       marker: { size: 6 }
     };
 
+    // ---- ここが追加/変更点：初期カメラ ----
+    // 目標：
+    // - 原点が「手前左」に見える
+    // - +X が右方向
+    // - +Y が奥方向
+    // - Z は上
+    //
+    // 典型的には、カメラを (X-, Y-, Z+) 側に置くと「原点が手前左」になりやすいです。
+    const initialCamera = {
+      eye:   { x:  0.0, y:  -1.5, z: 0.5 },
+      center:{ x:  0.0, y:  0.0, z: 0.0 },
+      up:    { x:  0.0, y:  0.0, z: 1.0 }
+    };
+
     const layout = {
       margin: {l:0, r:0, t:10, b:0},
+
+      // ---- ここが追加：SSE restyle をしてもユーザーの回転/ズームを保持 ----
+      // 値が同じなら plotly が「UI状態（カメラ等）を維持」します
+      uirevision: "keep-camera",
+
       scene: {
         xaxis: {title:"X (mm)", range:[AX.minx, AX.maxx], showgrid:true, zeroline:true},
         yaxis: {title:"Y (mm)", range:[AX.miny, AX.maxy], showgrid:true, zeroline:true},
         zaxis: {title:"Z (mm)", range:[AX.minz, AX.maxz], showgrid:true, zeroline:true},
-        aspectmode: "data"
+        aspectmode: "data",
+
+        // ---- ここが追加：初期視点 ----
+        camera: initialCamera,
+
+        // 好みで：ドラッグを回転に寄せる（不要なら消してOK）
+        dragmode: "orbit"
       },
       showlegend: false
     };
