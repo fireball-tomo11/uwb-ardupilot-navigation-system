@@ -43,12 +43,12 @@ AFTER_INIT_SLEEP_SEC = 0.3
 UDP_HOST = "192.168.2.101" #随時変更
 UDP_PORT = 9900
 
-# --- アンカー座標（m）mac_addressと対応させる（ユーザー指定の正しい座標） ---
+# --- アンカー座標（m）mac_addressと対応させる
 ANCHORS: Dict[str, Tuple[float, float, float]] = {
-    "0x0001": (0.0, 0.0, 0.5),
-    "0x0002": (2.0, 0.0, 2.0),
-    "0x0003": (0.0, 2.0, 2.0),
-    "0x0004": (2.0, 2.0, 0.5),
+    "0x0001": (0.0, 0.0, 2.0),
+    "0x0002": (3.0, 0.0, 0.0),
+    "0x0003": (0.0, 3.0, 0.0),
+    "0x0004": (3.0, 3.0, 2.0),
 }
 
 # beaconの順序（固定）
@@ -86,9 +86,10 @@ ORIGIN_LAT_DEG = 34.981650000
 ORIGIN_LON_DEG = 135.964250000
 ORIGIN_ALT_M = 149.921
 
-# ここでは x->East, y->North, z->Up を仮定
-AXIS_X_TO_EAST = 1.0
-AXIS_Y_TO_NORTH = 1.0
+# X軸(正)が西なので、東へはマイナス方向 (-1.0)
+AXIS_X_TO_EAST = -1.0
+# Y軸(正)が南なので、北へはマイナス方向 (-1.0)
+AXIS_Y_TO_NORTH = -1.0
 AXIS_Z_TO_UP = 1.0
 
 EARTH_RADIUS_M = 6378137.0  # WGS84近似
@@ -216,34 +217,38 @@ def read_session_block(ser: serial.Serial) -> Optional[str]:
 
     return "".join(buf_lines)
 
+# =========================================================
+# 位置推定（Gauss-Newton with Dynamic Z-Constraint）
+# =========================================================
+# Z軸を安定させる強さ（0.1:弱い ～ 10.0:強い）
+# 値を大きくするほど「前の高さ」に強く張り付きます。
+Z_CONSTRAINT_WEIGHT = 2.0 
 
-# =========================================================
-# 位置推定（Gauss-Newton）
-# =========================================================
 def solve_position_gn(
     anchors: Dict[str, Tuple[float, float, float]],
     ranges_m: Dict[str, float],
-    x0: Optional[np.ndarray] = None
+    x0: Optional[np.ndarray] = None,
+    target_z_m: float = 1.0  # デフォルト値（初回用）
 ) -> Tuple[Optional[np.ndarray], float]:
     """
-    anchors: mac -> (ax,ay,az) [m]
-    ranges_m: mac -> r [m]
-    return:
-      (pos[m] as np.array([x,y,z]) or None, rms_residual[m])
+    Gauss-Newton法（動的Z制約付き）
+    target_z_m: この高さに引き寄せる制約を加える
     """
     used = []
     for mac, rr in ranges_m.items():
         if mac in anchors:
             used.append((mac, anchors[mac], rr))
 
-    if len(used) < 4:
+    if len(used) < 3:
         return None, float("inf")
 
-    A = np.array([a for _, a, _ in used], dtype=np.float64)  # (N,3)
-    r = np.array([rr for _, _, rr in used], dtype=np.float64)  # (N,)
+    A = np.array([a for _, a, _ in used], dtype=np.float64)
+    r = np.array([rr for _, _, rr in used], dtype=np.float64)
 
+    # 初期値
     if x0 is None:
         x = np.mean(A, axis=0).copy()
+        x[2] = target_z_m  # 初期高さもターゲットに合わせる
     else:
         x = x0.astype(np.float64).copy()
 
@@ -253,11 +258,22 @@ def solve_position_gn(
         f = d - r
         J = diff / d[:, None]
 
-        H = J.T @ J
-        g = J.T @ f
+        # --- Z制約の適用 ---
+        # 「現在の計算値 x[2]」と「ターゲット(直前値) target_z_m」との差
+        z_err = x[2] - target_z_m
+        
+        w_sqrt = np.sqrt(Z_CONSTRAINT_WEIGHT)
+        
+        # 残差とヤコビアンを拡張
+        f_aug = np.append(f, w_sqrt * z_err)
+        row_z = np.array([[0, 0, w_sqrt]])
+        J_aug = np.vstack([J, row_z])
+        
+        H = J_aug.T @ J_aug
+        g = J_aug.T @ f_aug
 
-        lam = 1e-6
-        H = H + lam * np.eye(3)
+        # ダンピング
+        H = H + 1e-4 * np.eye(3)
 
         try:
             dx = -np.linalg.solve(H, g)
@@ -270,12 +286,13 @@ def solve_position_gn(
             break
         x = x_new
 
+    # RMS計算（制約項は含めず、純粋な測距誤差で評価）
     diff = x[None, :] - A
     d = np.linalg.norm(diff, axis=1) + 1e-12
-    f = d - r
-    rms = float(np.sqrt(np.mean(f * f)))
+    f_final = d - r
+    rms = float(np.sqrt(np.mean(f_final * f_final)))
+    
     return x, rms
-
 
 # =========================================================
 # UDP送信（GUI用）
@@ -390,14 +407,25 @@ class ArduPilotUartSender:
 
         status = "A"
 
+        # ▼▼▼ 修正: RMS誤差をHDOPに変換する ▼▼▼
+        # RMS(m) が小さいほど HDOP も小さくする。
+        # 目安: RMS 0.1m -> HDOP 1.0 / RMS 1.0m -> HDOP 10.0
+        # 最小値は0.6くらいにしておく（あまり小さすぎると過信するため）
+        calc_hdop = max(0.6, rms_m * 10.0)
+        
+        # HDOPの上限クリップ（99.9まで）
+        if calc_hdop > 99.9:
+            calc_hdop = 99.9
+        # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
         gga = build_gga(
             now_tokyo_dt=t_tokyo,
             lat_deg=float(lat_deg),
             lon_deg=float(lon_deg),
             alt_m=float(alt_m),
             fix_quality=1,
-            num_sats=8,
-            hdop=1.0,
+            num_sats=12,         # 衛星数は少し多め(12)にしておくと安心する設定が多い
+            hdop=calc_hdop,      # ★ここで計算したHDOPを入れる
             geoid_sep_m=0.0,
         )
         rmc = build_rmc(
@@ -412,6 +440,37 @@ class ArduPilotUartSender:
         self.ser_out.write(gga.encode("ascii"))
         self.ser_out.write(rmc.encode("ascii"))
         self.ser_out.flush()
+        
+    # def send_position_nmea(self, lat_deg: float, lon_deg: float, alt_m: float, rms_m: float) -> None:
+    #     t_tokyo = now_tokyo()
+
+    #     if (not np.isfinite(lat_deg)) or (not np.isfinite(lon_deg)) or (not np.isfinite(alt_m)):
+    #         return
+
+    #     status = "A"
+
+    #     gga = build_gga(
+    #         now_tokyo_dt=t_tokyo,
+    #         lat_deg=float(lat_deg),
+    #         lon_deg=float(lon_deg),
+    #         alt_m=float(alt_m),
+    #         fix_quality=1,
+    #         num_sats=8,
+    #         hdop=1.0,
+    #         geoid_sep_m=0.0,
+    #     )
+    #     rmc = build_rmc(
+    #         now_tokyo_dt=t_tokyo,
+    #         lat_deg=float(lat_deg),
+    #         lon_deg=float(lon_deg),
+    #         status=status,
+    #         sog_knots=0.0,
+    #         cog_deg=0.0,
+    #     )
+
+    #     self.ser_out.write(gga.encode("ascii"))
+    #     self.ser_out.write(rmc.encode("ascii"))
+    #     self.ser_out.flush()
 
 
 # =========================================================
@@ -475,6 +534,9 @@ def main():
     smooth_xyz = None  # (x,y,z) in meters
     smooth_latlonalt = None  # (lat,lon,alt)
 
+    # 直前の有効な高さを保持する変数（初期値は1.0m程度にしておく）
+    last_valid_z = 1.0
+
     print("=== UWB -> GN -> (0.1s mean) -> LatLon -> ArduPilot (NMEA) @20Hz ===")
     print(f"IN : {SERIAL_PORT_IN} @ {BAUDRATE_IN}")
     print(f"OUT: {SERIAL_PORT_OUT} @ {BAUDRATE_OUT}")
@@ -492,12 +554,28 @@ def main():
                 ranges_m: Dict[str, float] = sess.get("ranges_m", {})
 
                 usable = sum(1 for mac in ANCHOR_ORDER if mac in ranges_m)
-                if usable >= 4:
+                if usable >= 3: # 3つ以上あれば計算トライ
                     x0 = last_pos if last_pos is not None else None
-                    pos, rms = solve_position_gn(ANCHORS, ranges_m, x0=x0)
+                    # pos, rms = solve_position_gn(ANCHORS, ranges_m, x0=x0)
+                    # ▼▼▼ ここを変更：前回のZ値をターゲットとして渡す ▼▼▼
+                    pos, rms = solve_position_gn(
+                        ANCHORS, 
+                        ranges_m, 
+                        x0=x0, 
+                        target_z_m=last_valid_z
+                    )
+                    # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
                     if pos is not None:
                         last_pos = pos
                         x_m_raw, y_m_raw, z_m_raw = float(pos[0]), float(pos[1]), float(pos[2])
+
+                        # ▼▼▼ 次回のためにZ値を更新（平滑化しても良い） ▼▼▼
+                        # 生値をそのまま使うとノイズでドリフトする可能性があるので、
+                        # 90%は前回の値、10%だけ新しい値を反映するなど、ローパスフィルタを通すとより安定します。
+                        alpha = 0.1
+                        last_valid_z = last_valid_z * (1.0 - alpha) + z_m_raw * alpha
+                        # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
                         t_mono = time.monotonic()
                         update_deque_and_prune(pos_buf, t_mono, x_m_raw, y_m_raw, z_m_raw, SMOOTH_WINDOW_SEC)
